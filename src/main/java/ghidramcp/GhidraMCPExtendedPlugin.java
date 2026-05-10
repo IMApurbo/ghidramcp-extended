@@ -8,7 +8,6 @@ import ghidra.app.plugin.ProgramPlugin;
 import ghidra.framework.plugintool.PluginInfo;
 import ghidra.framework.plugintool.PluginTool;
 import ghidra.framework.plugintool.util.PluginStatus;
-import ghidra.program.flatapi.FlatProgramAPI;
 import ghidra.program.model.address.*;
 import ghidra.program.model.data.*;
 import ghidra.program.model.listing.*;
@@ -271,12 +270,16 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         Function f = findFunctionByName(name);
         if (f == null) { sendResponse(ex, 404, "Function not found: " + name); return; }
         DecompInterface decomp = new DecompInterface();
-        decomp.openProgram(prog());
-        DecompileResults res = decomp.decompileFunction(f, 60, TaskMonitor.DUMMY);
-        if (res.decompileCompleted() && res.getDecompiledFunction() != null) {
-            sendResponse(ex, 200, res.getDecompiledFunction().getC());
-        } else {
-            sendResponse(ex, 500, "Decompilation failed: " + res.getErrorMessage());
+        try {
+            decomp.openProgram(prog());
+            DecompileResults res = decomp.decompileFunction(f, 60, TaskMonitor.DUMMY);
+            if (res.decompileCompleted() && res.getDecompiledFunction() != null) {
+                sendResponse(ex, 200, res.getDecompiledFunction().getC());
+            } else {
+                sendResponse(ex, 500, "Decompilation failed: " + res.getErrorMessage());
+            }
+        } finally {
+            decomp.dispose();
         }
     }
 
@@ -298,7 +301,7 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         if (!checkProgram(ex)) return;
         Map<String,String> q = parseQuery(ex.getRequestURI().getQuery());
         String addrParam = q.get("address");
-        int length = Integer.parseInt(q.getOrDefault("length","16"));
+        int length = Math.min(Integer.parseInt(q.getOrDefault("length","16")), 65536);
         if (addrParam == null) { sendResponse(ex, 400, "?address= required"); return; }
         Address a = parseAddr(addrParam);
         if (a == null) { sendResponse(ex, 400, "Invalid address: " + addrParam); return; }
@@ -345,6 +348,7 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         String pattern = q.get("pattern");
         if (pattern == null) { sendResponse(ex, 400, "?pattern= required (hex, ?? = wildcard)"); return; }
         pattern = pattern.replaceAll("\\s","");
+        if (pattern.length() % 2 != 0) { sendResponse(ex, 400, "pattern must be even-length hex string"); return; }
         int len = pattern.length() / 2;
         byte[] values = new byte[len], masks = new byte[len];
         for (int i = 0; i < len; i++) {
@@ -434,8 +438,13 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         if (f == null) { sendResponse(ex, 404, "Function not found"); return; }
 
         DecompInterface decomp = new DecompInterface();
-        decomp.openProgram(prog());
-        DecompileResults res = decomp.decompileFunction(f, 60, TaskMonitor.DUMMY);
+        DecompileResults res;
+        try {
+            decomp.openProgram(prog());
+            res = decomp.decompileFunction(f, 60, TaskMonitor.DUMMY);
+        } finally {
+            decomp.dispose();
+        }
         if (!res.decompileCompleted()) { sendResponse(ex, 500, "Decompilation failed"); return; }
 
         HighFunction hf = res.getHighFunction();
@@ -483,7 +492,6 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
             MemoryBlock block = prog().getMemory().getBlock(a);
             if (block != null && !block.isWrite()) block.setWrite(true);
 
-            // Clear existing instructions BEFORE writing bytes (prevents MemoryAccessException)
             prog().getListing().clearCodeUnits(a, a.add(patch.length - 1), false);
             prog().getMemory().setBytes(a, patch);
             prog().endTransaction(tx, true);
@@ -509,6 +517,8 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
             MemoryBlock block = prog().getMemory().getBlock(a);
             if (block != null && !block.isWrite()) block.setWrite(true);
 
+            // Clear existing instruction before assembling (prevents MemoryAccessException)
+            prog().getListing().clearCodeUnits(a, a.add(15), false);
             Assembler asm = Assemblers.getAssembler(prog());
             asm.assemble(a, asmText);
             prog().endTransaction(tx, true);
@@ -536,11 +546,14 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
             byte[] nops = new byte[count];
             Arrays.fill(nops, (byte)0x90);
 
-            // Make writable if needed
-            MemoryBlock block = prog().getMemory().getBlock(start);
-            if (block != null && !block.isWrite()) block.setWrite(true);
+            // Make ALL blocks in range writable (range may span multiple blocks)
+            for (MemoryBlock mb : prog().getMemory().getBlocks()) {
+                if (!mb.isInitialized() || !mb.isLoaded()) continue;
+                if (mb.getEnd().compareTo(start) < 0) continue;
+                if (mb.getStart().compareTo(end) > 0) continue;
+                if (!mb.isWrite()) mb.setWrite(true);
+            }
 
-            // Clear existing instructions BEFORE writing bytes (prevents MemoryAccessException)
             prog().getListing().clearCodeUnits(start, end, false);
             prog().getMemory().setBytes(start, nops);
             prog().endTransaction(tx, true);
@@ -641,7 +654,8 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
             // Ghidra's built-in C parser via the program's data type manager.
             ghidra.app.util.cparser.C.CParser parser =
                 new ghidra.app.util.cparser.C.CParser(prog().getDataTypeManager());
-            DataType dt = parser.parse(sig + ";");
+            String sigNorm = sig.trim().replaceAll(";+$", "");
+            DataType dt = parser.parse(sigNorm + ";");
             if (!(dt instanceof ghidra.program.model.data.FunctionDefinitionDataType)) {
                 throw new Exception("Parsed type is not a function definition: " + dt.getClass().getSimpleName());
             }
@@ -653,7 +667,7 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
             prog().endTransaction(tx, true);
             sendResponse(ex, 200, "Signature applied to " + funcName + ": " + sig);
         } catch (Exception e) {
-            prog().endTransaction(tx, false);
+            try { prog().endTransaction(tx, false); } catch (Exception ignored) {}
             sendResponse(ex, 500, "Signature parse failed: " + e.getMessage() +
                 "\nTip: use full C prototype, e.g. 'int foo(char* a, int b)'");
         }
@@ -683,17 +697,62 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         Map<String,String> b = parseBody(ex);
         String outPath = b.get("path");
         if (outPath == null) { sendResponse(ex, 400, "path required"); return; }
+
+        // Get the original binary path from Ghidra's program
+        String origPath = prog().getExecutablePath();
+        if (origPath == null || origPath.isEmpty()) {
+            sendResponse(ex, 500, "Cannot determine original executable path from Ghidra"); return;
+        }
+        File origFile = new File(origPath);
+        if (!origFile.exists()) {
+            sendResponse(ex, 500, "Original file not found: " + origPath); return;
+        }
+
         File outFile = new File(outPath);
-        outFile.getParentFile().mkdirs();
-        try (FileOutputStream fos = new FileOutputStream(outFile)) {
+        if (outFile.getParentFile() != null) outFile.getParentFile().mkdirs();
+
+        // Step 1: copy original file verbatim → preserves ELF/PE headers and structure
+        Files.copy(origFile.toPath(), outFile.toPath(),
+                   java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+
+        // Step 2: Walk memory blocks and write patched bytes at correct file offsets.
+        // Use MemoryBlockSourceInfo.getFileBytesOffset() — the correct Ghidra API
+        // for getting the actual offset into the backing FileBytes (i.e. the file).
+        // This works correctly for ELF, PE, and PIE binaries regardless of imageBase.
+        int patchedBlocks = 0;
+        try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(outFile, "rw")) {
             for (MemoryBlock block : prog().getMemory().getBlocks()) {
                 if (!block.isInitialized()) continue;
-                byte[] buf = new byte[(int) block.getSize()];
+
+                java.util.List<MemoryBlockSourceInfo> infos = block.getSourceInfos();
+                if (infos == null || infos.isEmpty()) continue;
+
+                MemoryBlockSourceInfo info = infos.get(0);
+                // getFileBytesOffset() returns long in this Ghidra version; -1 means not file-backed
+                long fileOffset = info.getFileBytesOffset();
+                if (fileOffset < 0) continue;
+                long blockSize  = block.getSize();
+                long writeSize  = Math.min(blockSize, outFile.length() - fileOffset);
+                if (fileOffset < 0 || fileOffset >= outFile.length() || writeSize <= 0) continue;
+
+                byte[] buf = new byte[(int) writeSize];
                 block.getBytes(block.getStart(), buf);
-                fos.write(buf);
+
+                raf.seek(fileOffset);
+                raf.write(buf);
+                patchedBlocks++;
             }
         }
-        sendResponse(ex, 200, "Exported " + outFile.length() + " bytes to " + outPath);
+
+        outFile.setExecutable(true);
+        if (patchedBlocks == 0) {
+            sendResponse(ex, 200, "WARNING: exported " + outFile.length() + " bytes to " + outPath +
+                " but no file-backed blocks were found — file may be unpatched. " +
+                "Ensure the binary was loaded from disk (not imported from project).");
+        } else {
+            sendResponse(ex, 200, "Exported " + outFile.length() + " bytes to " + outPath +
+                " (original: " + origPath + ", patched blocks: " + patchedBlocks + ")");
+        }
     }
 
     // ── Utility ───────────────────────────────────────────────────────────────
