@@ -1,0 +1,13 @@
+# 1. Replace the source
+cp GhidraMCPExtendedPlugin.java ~/ghidramcp-extended/src/main/java/ghidramcp/GhidraMCPExtendedPlugin.java
+
+# 2. Build
+cd ~/ghidramcp-extended
+mvn clean package assembly:single
+
+# 3. Repackage
+cp target/GhidraMCPExtended-1.0.0-jar-with-dependencies.jar \
+   dist_fixed/GhidraMCPExtended/lib/GhidraMCPExtended.jar
+
+rm -f GhidraMCPExtended.zip
+cd dist_fixed && zip -r ../GhidraMCPExtended.zip GhidraMCPExtended/ && cd ..
