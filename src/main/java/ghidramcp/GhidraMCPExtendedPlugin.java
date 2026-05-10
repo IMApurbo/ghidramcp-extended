@@ -19,7 +19,9 @@ import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.plugin.assembler.Assembler;
 import ghidra.app.plugin.assembler.Assemblers;
+import ghidra.app.cmd.function.ApplyFunctionSignatureCmd;
 import ghidra.util.task.TaskMonitor;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 
 import java.io.*;
 import java.net.InetSocketAddress;
@@ -67,31 +69,34 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
 
     private void registerHandlers() {
         // READ
-        server.createContext("/list_methods",       ex -> safe(ex, this::handleListMethods));
-        server.createContext("/list_classes",        ex -> safe(ex, this::handleListClasses));
-        server.createContext("/list_imports",        ex -> safe(ex, this::handleListImports));
-        server.createContext("/list_exports",        ex -> safe(ex, this::handleListExports));
-        server.createContext("/list_segments",       ex -> safe(ex, this::handleListSegments));
-        server.createContext("/list_strings",        ex -> safe(ex, this::handleListStrings));
-        server.createContext("/decompile_function",  ex -> safe(ex, this::handleDecompile));
-        server.createContext("/get_function_by_name",ex -> safe(ex, this::handleGetFunctionByName));
-        server.createContext("/read_bytes",          ex -> safe(ex, this::handleReadBytes));
-        server.createContext("/xrefs_to",            ex -> safe(ex, this::handleXrefsTo));
-        server.createContext("/xrefs_from",          ex -> safe(ex, this::handleXrefsFrom));
-        server.createContext("/search_bytes",        ex -> safe(ex, this::handleSearchBytes));
-        server.createContext("/search_strings",      ex -> safe(ex, this::handleSearchStrings));
+        server.createContext("/list_methods",        ex -> safe(ex, this::handleListMethods));
+        server.createContext("/list_classes",         ex -> safe(ex, this::handleListClasses));
+        server.createContext("/list_imports",         ex -> safe(ex, this::handleListImports));
+        server.createContext("/list_exports",         ex -> safe(ex, this::handleListExports));
+        server.createContext("/list_segments",        ex -> safe(ex, this::handleListSegments));
+        server.createContext("/list_strings",         ex -> safe(ex, this::handleListStrings));
+        server.createContext("/decompile_function",   ex -> safe(ex, this::handleDecompile));
+        server.createContext("/get_function_by_name", ex -> safe(ex, this::handleGetFunctionByName));
+        server.createContext("/read_bytes",           ex -> safe(ex, this::handleReadBytes));
+        server.createContext("/xrefs_to",             ex -> safe(ex, this::handleXrefsTo));
+        server.createContext("/xrefs_from",           ex -> safe(ex, this::handleXrefsFrom));
+        server.createContext("/search_bytes",         ex -> safe(ex, this::handleSearchBytes));
+        server.createContext("/search_strings",       ex -> safe(ex, this::handleSearchStrings));
         // WRITE
-        server.createContext("/rename_function",     ex -> safe(ex, this::handleRenameFunction));
-        server.createContext("/rename_data",         ex -> safe(ex, this::handleRenameData));
-        server.createContext("/rename_variable",     ex -> safe(ex, this::handleRenameVariable));
-        server.createContext("/patch_bytes",         ex -> safe(ex, this::handlePatchBytes));
-        server.createContext("/patch_instruction",   ex -> safe(ex, this::handlePatchInstruction));
-        server.createContext("/nop_range",           ex -> safe(ex, this::handleNopRange));
-        server.createContext("/set_comment",         ex -> safe(ex, this::handleSetComment));
-        server.createContext("/set_bookmark",        ex -> safe(ex, this::handleSetBookmark));
-        server.createContext("/set_data_type",       ex -> safe(ex, this::handleSetDataType));
+        server.createContext("/rename_function",      ex -> safe(ex, this::handleRenameFunction));
+        server.createContext("/rename_data",          ex -> safe(ex, this::handleRenameData));
+        server.createContext("/rename_variable",      ex -> safe(ex, this::handleRenameVariable));
+        server.createContext("/patch_bytes",          ex -> safe(ex, this::handlePatchBytes));
+        server.createContext("/patch_instruction",    ex -> safe(ex, this::handlePatchInstruction));
+        server.createContext("/nop_range",            ex -> safe(ex, this::handleNopRange));
+        server.createContext("/set_comment",          ex -> safe(ex, this::handleSetComment));
+        server.createContext("/set_bookmark",         ex -> safe(ex, this::handleSetBookmark));
+        server.createContext("/set_data_type",        ex -> safe(ex, this::handleSetDataType));
+        // FIX 1: these two were missing from registerHandlers entirely
+        server.createContext("/set_function_signature", ex -> safe(ex, this::handleSetFunctionSignature));
+        server.createContext("/run_analysis",           ex -> safe(ex, this::handleRunAnalysis));
         // EXPORT
-        server.createContext("/export_binary",       ex -> safe(ex, this::handleExportBinary));
+        server.createContext("/export_binary",        ex -> safe(ex, this::handleExportBinary));
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
@@ -101,8 +106,11 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
     private void safe(HttpExchange ex, Handler h) {
         try { h.handle(ex); }
         catch (Exception e) {
-            try { sendResponse(ex, 500, "Error: " + e.getMessage()); }
-            catch (IOException ignored) {}
+            try {
+                java.io.StringWriter sw = new java.io.StringWriter();
+                e.printStackTrace(new java.io.PrintWriter(sw));
+                sendResponse(ex, 500, "EXCEPTION: " + sw.toString());
+            } catch (IOException ignored) {}
         }
     }
 
@@ -145,8 +153,27 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         return true;
     }
 
-    private Address addr(String s) {
-        return prog().getAddressFactory().getAddress(s);
+    /**
+     * FIX 2: Robust address parser.
+     * Accepts: "0x001011eb", "001011eb", "00401000", decimal strings.
+     * Previously addr() called getAddress(String) which silently returned null
+     * for plain hex strings without "0x", causing NullPointerException -> 500.
+     */
+    private Address parseAddr(String s) {
+        if (s == null) return null;
+        s = s.trim();
+        try {
+            // Try Ghidra's own parser first (handles "ram:001011eb" etc.)
+            Address a = prog().getAddressFactory().getAddress(s);
+            if (a != null) return a;
+        } catch (Exception ignored) {}
+        try {
+            // Strip 0x prefix if present, parse as unsigned hex
+            String hex = s.startsWith("0x") || s.startsWith("0X") ? s.substring(2) : s;
+            long offset = Long.parseUnsignedLong(hex, 16);
+            return prog().getAddressFactory().getDefaultAddressSpace().getAddress(offset);
+        } catch (Exception ignored) {}
+        return null;
     }
 
     private String addrStr(Address a) { return a == null ? "?" : a.toString(); }
@@ -173,7 +200,6 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
     private void handleListClasses(HttpExchange ex) throws Exception {
         if (!checkProgram(ex)) return;
         StringBuilder sb = new StringBuilder();
-        // Iterate all symbols and filter by namespace type
         SymbolIterator it = prog().getSymbolTable().getDefinedSymbols();
         Set<String> seen = new HashSet<>();
         while (it.hasNext()) {
@@ -262,20 +288,22 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         Function f = findFunctionByName(name);
         if (f == null) { sendResponse(ex, 404, "Not found: " + name); return; }
         sendResponse(ex, 200,
-            "name: " + f.getName() + "\n" +
-            "address: " + addrStr(f.getEntryPoint()) + "\n" +
+            "name: "      + f.getName() + "\n" +
+            "address: "   + addrStr(f.getEntryPoint()) + "\n" +
             "signature: " + f.getSignature().getPrototypeString() + "\n" +
-            "size: " + f.getBody().getNumAddresses() + " bytes");
+            "size: "      + f.getBody().getNumAddresses() + " bytes");
     }
 
     private void handleReadBytes(HttpExchange ex) throws Exception {
         if (!checkProgram(ex)) return;
         Map<String,String> q = parseQuery(ex.getRequestURI().getQuery());
-        String addrStr = q.get("address");
+        String addrParam = q.get("address");
         int length = Integer.parseInt(q.getOrDefault("length","16"));
-        if (addrStr == null) { sendResponse(ex, 400, "?address= required"); return; }
+        if (addrParam == null) { sendResponse(ex, 400, "?address= required"); return; }
+        Address a = parseAddr(addrParam);
+        if (a == null) { sendResponse(ex, 400, "Invalid address: " + addrParam); return; }
         byte[] buf = new byte[length];
-        prog().getMemory().getBytes(addr(addrStr), buf);
+        prog().getMemory().getBytes(a, buf);
         StringBuilder sb = new StringBuilder();
         for (byte b : buf) sb.append(String.format("%02x ", b));
         sendResponse(ex, 200, sb.toString().trim());
@@ -286,8 +314,10 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         Map<String,String> q = parseQuery(ex.getRequestURI().getQuery());
         String a = q.get("address");
         if (a == null) { sendResponse(ex, 400, "?address= required"); return; }
+        Address addr = parseAddr(a);
+        if (addr == null) { sendResponse(ex, 400, "Invalid address: " + a); return; }
         StringBuilder sb = new StringBuilder();
-        for (Reference r : prog().getReferenceManager().getReferencesTo(addr(a)))
+        for (Reference r : prog().getReferenceManager().getReferencesTo(addr))
             sb.append(addrStr(r.getFromAddress()))
               .append(" -> ").append(addrStr(r.getToAddress()))
               .append(" [").append(r.getReferenceType()).append("]\n");
@@ -299,8 +329,10 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         Map<String,String> q = parseQuery(ex.getRequestURI().getQuery());
         String a = q.get("address");
         if (a == null) { sendResponse(ex, 400, "?address= required"); return; }
+        Address addr = parseAddr(a);
+        if (addr == null) { sendResponse(ex, 400, "Invalid address: " + a); return; }
         StringBuilder sb = new StringBuilder();
-        for (Reference r : prog().getReferenceManager().getReferencesFrom(addr(a)))
+        for (Reference r : prog().getReferenceManager().getReferencesFrom(addr))
             sb.append(addrStr(r.getFromAddress()))
               .append(" -> ").append(addrStr(r.getToAddress()))
               .append(" [").append(r.getReferenceType()).append("]\n");
@@ -353,9 +385,11 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         String newName = b.get("new_name");
         if (newName == null) { sendResponse(ex, 400, "new_name required"); return; }
         Function f = null;
-        if (b.containsKey("address"))
-            f = prog().getFunctionManager().getFunctionAt(addr(b.get("address")));
-        else if (b.containsKey("old_name"))
+        if (b.containsKey("address")) {
+            Address a = parseAddr(b.get("address"));
+            if (a != null) f = prog().getFunctionManager().getFunctionAt(a);
+        }
+        if (f == null && b.containsKey("old_name"))
             f = findFunctionByName(b.get("old_name"));
         if (f == null) { sendResponse(ex, 404, "Function not found"); return; }
         int tx = prog().startTransaction("rename_function");
@@ -372,16 +406,17 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
     private void handleRenameData(HttpExchange ex) throws Exception {
         if (!requirePost(ex) || !checkProgram(ex)) return;
         Map<String,String> b = parseBody(ex);
-        String addrStr = b.get("address"), newName = b.get("new_name");
-        if (addrStr == null || newName == null) { sendResponse(ex, 400, "address and new_name required"); return; }
+        String addrParam = b.get("address"), newName = b.get("new_name");
+        if (addrParam == null || newName == null) { sendResponse(ex, 400, "address and new_name required"); return; }
+        Address a = parseAddr(addrParam);
+        if (a == null) { sendResponse(ex, 400, "Invalid address: " + addrParam); return; }
         int tx = prog().startTransaction("rename_data");
         try {
-            Address a = addr(addrStr);
             Symbol sym = prog().getSymbolTable().getPrimarySymbol(a);
             if (sym != null) sym.setName(newName, SourceType.USER_DEFINED);
             else prog().getSymbolTable().createLabel(a, newName, SourceType.USER_DEFINED);
             prog().endTransaction(tx, true);
-            sendResponse(ex, 200, "Label set: " + newName + " @ " + addrStr);
+            sendResponse(ex, 200, "Label set: " + newName + " @ " + addrParam);
         } catch (Exception e) {
             prog().endTransaction(tx, false);
             throw e;
@@ -424,23 +459,35 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         }
     }
 
+    /**
+     * FIX 2 applied: use parseAddr() instead of addr() everywhere in patch handlers.
+     * FIX 3: make memory block writable before patching if it isn't already.
+     */
     private void handlePatchBytes(HttpExchange ex) throws Exception {
         if (!requirePost(ex) || !checkProgram(ex)) return;
         Map<String,String> b = parseBody(ex);
-        String addrStr = b.get("address"), hexBytes = b.get("bytes");
-        if (addrStr == null || hexBytes == null) { sendResponse(ex, 400, "address and bytes required"); return; }
+        String addrParam = b.get("address"), hexBytes = b.get("bytes");
+        if (addrParam == null || hexBytes == null) { sendResponse(ex, 400, "address and bytes required"); return; }
         hexBytes = hexBytes.replaceAll("\\s","");
+        if (hexBytes.length() % 2 != 0) { sendResponse(ex, 400, "bytes must be even-length hex string"); return; }
         byte[] patch = new byte[hexBytes.length()/2];
         for (int i = 0; i < patch.length; i++)
             patch[i] = (byte) Integer.parseInt(hexBytes.substring(i*2, i*2+2), 16);
+
+        Address a = parseAddr(addrParam);
+        if (a == null) { sendResponse(ex, 400, "Invalid address: " + addrParam); return; }
+
         int tx = prog().startTransaction("patch_bytes");
         try {
-            Address a = addr(addrStr);
-            prog().getMemory().setBytes(a, patch);
-            // Clear stale disassembly so listing stays correct
+            // Make the block writable if needed
+            MemoryBlock block = prog().getMemory().getBlock(a);
+            if (block != null && !block.isWrite()) block.setWrite(true);
+
+            // Clear existing instructions BEFORE writing bytes (prevents MemoryAccessException)
             prog().getListing().clearCodeUnits(a, a.add(patch.length - 1), false);
+            prog().getMemory().setBytes(a, patch);
             prog().endTransaction(tx, true);
-            sendResponse(ex, 200, "Patched " + patch.length + " byte(s) @ " + addrStr);
+            sendResponse(ex, 200, "Patched " + patch.length + " byte(s) @ " + addrParam);
         } catch (Exception e) {
             prog().endTransaction(tx, false);
             throw e;
@@ -450,15 +497,22 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
     private void handlePatchInstruction(HttpExchange ex) throws Exception {
         if (!requirePost(ex) || !checkProgram(ex)) return;
         Map<String,String> b = parseBody(ex);
-        String addrStr = b.get("address"), asmText = b.get("asm");
-        if (addrStr == null || asmText == null) { sendResponse(ex, 400, "address and asm required"); return; }
+        String addrParam = b.get("address"), asmText = b.get("asm");
+        if (addrParam == null || asmText == null) { sendResponse(ex, 400, "address and asm required"); return; }
+
+        Address a = parseAddr(addrParam);
+        if (a == null) { sendResponse(ex, 400, "Invalid address: " + addrParam); return; }
+
         int tx = prog().startTransaction("patch_instruction");
         try {
-            Address a = addr(addrStr);
+            // Make the block writable if needed
+            MemoryBlock block = prog().getMemory().getBlock(a);
+            if (block != null && !block.isWrite()) block.setWrite(true);
+
             Assembler asm = Assemblers.getAssembler(prog());
             asm.assemble(a, asmText);
             prog().endTransaction(tx, true);
-            sendResponse(ex, 200, "Assembled '" + asmText + "' @ " + addrStr);
+            sendResponse(ex, 200, "Assembled '" + asmText + "' @ " + addrParam);
         } catch (Exception e) {
             prog().endTransaction(tx, false);
             throw e;
@@ -470,14 +524,25 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         Map<String,String> b = parseBody(ex);
         String startStr = b.get("start"), endStr = b.get("end");
         if (startStr == null || endStr == null) { sendResponse(ex, 400, "start and end required"); return; }
+
+        Address start = parseAddr(startStr);
+        Address end   = parseAddr(endStr);
+        if (start == null) { sendResponse(ex, 400, "Invalid start address: " + startStr); return; }
+        if (end   == null) { sendResponse(ex, 400, "Invalid end address: "   + endStr);   return; }
+
         int tx = prog().startTransaction("nop_range");
         try {
-            Address start = addr(startStr), end = addr(endStr);
             int count = (int)(end.subtract(start)) + 1;
             byte[] nops = new byte[count];
-            Arrays.fill(nops, (byte)0x90); // x86 NOP; adjust for other archs
-            prog().getMemory().setBytes(start, nops);
+            Arrays.fill(nops, (byte)0x90);
+
+            // Make writable if needed
+            MemoryBlock block = prog().getMemory().getBlock(start);
+            if (block != null && !block.isWrite()) block.setWrite(true);
+
+            // Clear existing instructions BEFORE writing bytes (prevents MemoryAccessException)
             prog().getListing().clearCodeUnits(start, end, false);
+            prog().getMemory().setBytes(start, nops);
             prog().endTransaction(tx, true);
             sendResponse(ex, 200, "NOP'd " + count + " byte(s) from " + startStr + " to " + endStr);
         } catch (Exception e) {
@@ -489,23 +554,24 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
     private void handleSetComment(HttpExchange ex) throws Exception {
         if (!requirePost(ex) || !checkProgram(ex)) return;
         Map<String,String> b = parseBody(ex);
-        String addrStr = b.get("address"), comment = b.get("comment");
+        String addrParam = b.get("address"), comment = b.get("comment");
         String type = b.getOrDefault("type","EOL").toUpperCase();
-        if (addrStr == null || comment == null) { sendResponse(ex, 400, "address and comment required"); return; }
-        // Use integer constants directly to avoid deprecated symbol issues
+        if (addrParam == null || comment == null) { sendResponse(ex, 400, "address and comment required"); return; }
+        Address a = parseAddr(addrParam);
+        if (a == null) { sendResponse(ex, 400, "Invalid address: " + addrParam); return; }
         int commentType;
         switch (type) {
-            case "PRE":        commentType = 1; break; // CodeUnit.PRE_COMMENT
-            case "POST":       commentType = 2; break; // CodeUnit.POST_COMMENT
-            case "PLATE":      commentType = 3; break; // CodeUnit.PLATE_COMMENT
-            case "REPEATABLE": commentType = 4; break; // CodeUnit.REPEATABLE_COMMENT
-            default:           commentType = 0; break; // CodeUnit.EOL_COMMENT
+            case "PRE":        commentType = 1; break;
+            case "POST":       commentType = 2; break;
+            case "PLATE":      commentType = 3; break;
+            case "REPEATABLE": commentType = 4; break;
+            default:           commentType = 0; break;
         }
         int tx = prog().startTransaction("set_comment");
         try {
-            prog().getListing().setComment(addr(addrStr), commentType, comment);
+            prog().getListing().setComment(a, commentType, comment);
             prog().endTransaction(tx, true);
-            sendResponse(ex, 200, "Comment set @ " + addrStr);
+            sendResponse(ex, 200, "Comment set @ " + addrParam);
         } catch (Exception e) {
             prog().endTransaction(tx, false);
             throw e;
@@ -515,16 +581,17 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
     private void handleSetBookmark(HttpExchange ex) throws Exception {
         if (!requirePost(ex) || !checkProgram(ex)) return;
         Map<String,String> b = parseBody(ex);
-        String addrStr = b.get("address");
-        if (addrStr == null) { sendResponse(ex, 400, "address required"); return; }
+        String addrParam = b.get("address");
+        if (addrParam == null) { sendResponse(ex, 400, "address required"); return; }
+        Address a = parseAddr(addrParam);
+        if (a == null) { sendResponse(ex, 400, "Invalid address: " + addrParam); return; }
         String category = b.getOrDefault("category","MCP");
         String note = b.getOrDefault("note","");
         int tx = prog().startTransaction("set_bookmark");
         try {
-            prog().getBookmarkManager().setBookmark(addr(addrStr),
-                BookmarkType.NOTE, category, note);
+            prog().getBookmarkManager().setBookmark(a, BookmarkType.NOTE, category, note);
             prog().endTransaction(tx, true);
-            sendResponse(ex, 200, "Bookmark set @ " + addrStr);
+            sendResponse(ex, 200, "Bookmark set @ " + addrParam);
         } catch (Exception e) {
             prog().endTransaction(tx, false);
             throw e;
@@ -534,18 +601,75 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
     private void handleSetDataType(HttpExchange ex) throws Exception {
         if (!requirePost(ex) || !checkProgram(ex)) return;
         Map<String,String> b = parseBody(ex);
-        String addrStr = b.get("address"), typeName = b.get("type");
-        if (addrStr == null || typeName == null) { sendResponse(ex, 400, "address and type required"); return; }
+        String addrParam = b.get("address"), typeName = b.get("type");
+        if (addrParam == null || typeName == null) { sendResponse(ex, 400, "address and type required"); return; }
+        Address a = parseAddr(addrParam);
+        if (a == null) { sendResponse(ex, 400, "Invalid address: " + addrParam); return; }
         DataTypeManager dtm = prog().getDataTypeManager();
         DataType dt = dtm.getDataType("/" + typeName);
+        if (dt == null) {
+            // Try without leading slash (some types are at root)
+            dt = dtm.getDataType(typeName);
+        }
         if (dt == null) { sendResponse(ex, 404, "Unknown data type: " + typeName); return; }
         int tx = prog().startTransaction("set_data_type");
         try {
-            Address a = addr(addrStr);
             prog().getListing().clearCodeUnits(a, a.add(dt.getLength()-1), false);
             prog().getListing().createData(a, dt);
             prog().endTransaction(tx, true);
-            sendResponse(ex, 200, "Data type '" + typeName + "' applied @ " + addrStr);
+            sendResponse(ex, 200, "Data type '" + typeName + "' applied @ " + addrParam);
+        } catch (Exception e) {
+            prog().endTransaction(tx, false);
+            throw e;
+        }
+    }
+
+    /**
+     * FIX 1a: set_function_signature — was never registered, now wired up.
+     * Parses the C prototype string and applies it via FlatProgramAPI.
+     */
+    private void handleSetFunctionSignature(HttpExchange ex) throws Exception {
+        if (!requirePost(ex) || !checkProgram(ex)) return;
+        Map<String,String> b = parseBody(ex);
+        String funcName = b.get("name"), sig = b.get("signature");
+        if (funcName == null || sig == null) { sendResponse(ex, 400, "name and signature required"); return; }
+        Function f = findFunctionByName(funcName);
+        if (f == null) { sendResponse(ex, 404, "Function not found: " + funcName); return; }
+        int tx = prog().startTransaction("set_function_signature");
+        try {
+            // Build a FunctionDefinitionDataType from the signature string using
+            // Ghidra's built-in C parser via the program's data type manager.
+            ghidra.app.util.cparser.C.CParser parser =
+                new ghidra.app.util.cparser.C.CParser(prog().getDataTypeManager());
+            DataType dt = parser.parse(sig + ";");
+            if (!(dt instanceof ghidra.program.model.data.FunctionDefinitionDataType)) {
+                throw new Exception("Parsed type is not a function definition: " + dt.getClass().getSimpleName());
+            }
+            ghidra.program.model.data.FunctionDefinitionDataType fdt =
+                (ghidra.program.model.data.FunctionDefinitionDataType) dt;
+            ApplyFunctionSignatureCmd cmd = new ApplyFunctionSignatureCmd(
+                f.getEntryPoint(), fdt, SourceType.USER_DEFINED);
+            cmd.applyTo(prog(), TaskMonitor.DUMMY);
+            prog().endTransaction(tx, true);
+            sendResponse(ex, 200, "Signature applied to " + funcName + ": " + sig);
+        } catch (Exception e) {
+            prog().endTransaction(tx, false);
+            sendResponse(ex, 500, "Signature parse failed: " + e.getMessage() +
+                "\nTip: use full C prototype, e.g. 'int foo(char* a, int b)'");
+        }
+    }
+
+    /**
+     * FIX 1b: run_analysis — was never registered, now wired up.
+     */
+    private void handleRunAnalysis(HttpExchange ex) throws Exception {
+        if (!requirePost(ex) || !checkProgram(ex)) return;
+        int tx = prog().startTransaction("run_analysis");
+        try {
+            AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(prog());
+            mgr.reAnalyzeAll(null);
+            prog().endTransaction(tx, true);
+            sendResponse(ex, 200, "Analysis scheduled. Check Ghidra's Analysis menu for progress.");
         } catch (Exception e) {
             prog().endTransaction(tx, false);
             throw e;
@@ -559,9 +683,6 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         Map<String,String> b = parseBody(ex);
         String outPath = b.get("path");
         if (outPath == null) { sendResponse(ex, 400, "path required"); return; }
-
-        // Export: read every initialized byte from memory and write to file
-        // This works regardless of format because we write the raw memory image
         File outFile = new File(outPath);
         outFile.getParentFile().mkdirs();
         try (FileOutputStream fos = new FileOutputStream(outFile)) {
