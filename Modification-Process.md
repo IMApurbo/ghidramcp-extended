@@ -9,30 +9,12 @@ nano ~/ghidramcp-extended/src/main/java/ghidramcp/GhidraMCPExtendedPlugin.java
 nano ~/ghidramcp-extended/bridge_mcp_ghidra_extended.py
 ```
 
----
-
-### Step 2 — Rebuild the Java plugin
+### Step 3 —Build and Repackage the extension
 ```bash
 cd ~/ghidramcp-extended
 mvn clean package assembly:single
-```
-Look for `BUILD SUCCESS` before continuing.
-
----
-
-### Step 3 — Repackage the extension
-```bash
-cd ~/ghidramcp-extended
-
-# Update the jar in dist_fixed
-cp target/GhidraMCPExtended-1.0.0-jar-with-dependencies.jar \
-   dist_fixed/GhidraMCPExtended/lib/GhidraMCPExtended.jar
-
-# Rebuild the zip
-rm -f GhidraMCPExtended.zip
-cd dist_fixed
-zip -r ../GhidraMCPExtended.zip GhidraMCPExtended/
-cd ..
+cp target/GhidraMCPExtended-1.0.0-jar-with-dependencies.jar dist_fixed/GhidraMCPExtended/lib/GhidraMCPExtended.jar
+rm -f GhidraMCPExtended.zip && cd dist_fixed && zip -r ../GhidraMCPExtended.zip GhidraMCPExtended/ && cd ..
 ```
 
 ---
