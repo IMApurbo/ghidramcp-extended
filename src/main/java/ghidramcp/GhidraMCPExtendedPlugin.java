@@ -18,6 +18,8 @@ import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.plugin.assembler.Assembler;
 import ghidra.app.plugin.assembler.Assemblers;
+import ghidra.app.plugin.assembler.AssemblySemanticException;
+import ghidra.app.plugin.assembler.AssemblySyntaxException;
 import ghidra.app.cmd.function.ApplyFunctionSignatureCmd;
 import ghidra.util.task.TaskMonitor;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
@@ -517,15 +519,45 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
             MemoryBlock block = prog().getMemory().getBlock(a);
             if (block != null && !block.isWrite()) block.setWrite(true);
 
-            // Clear existing instruction before assembling (prevents MemoryAccessException)
+            // Clear existing instruction(s) in a 15-byte window before assembling.
+            // 15 bytes is the maximum length of a single x86-64 instruction.
+            // This prevents MemoryAccessException: conflicts with instruction.
             prog().getListing().clearCodeUnits(a, a.add(15), false);
+
             Assembler asm = Assemblers.getAssembler(prog());
-            asm.assemble(a, asmText);
-            prog().endTransaction(tx, true);
-            sendResponse(ex, 200, "Assembled '" + asmText + "' @ " + addrParam);
-        } catch (Exception e) {
-            prog().endTransaction(tx, false);
-            throw e;
+            try {
+                // asm.assemble() writes bytes to memory; read them back to report
+                asm.assemble(a, asmText);
+                // Read back the assembled bytes to report length and hex
+                Instruction insn = prog().getListing().getInstructionAt(a);
+                int encodedLen = (insn != null) ? insn.getLength() : 1;
+                byte[] encoded = new byte[encodedLen];
+                prog().getMemory().getBytes(a, encoded);
+                prog().endTransaction(tx, true);
+                sendResponse(ex, 200,
+                    "Assembled [" + asmText + "] @ " + addrParam
+                    + " (" + encodedLen + " byte(s): " + bytesToHex(encoded) + ")");
+            } catch (AssemblySemanticException | AssemblySyntaxException asmEx) {
+                prog().endTransaction(tx, false);
+                String tip = "Assembly failed for [" + asmText + "]: " + asmEx.getMessage() + "\n"
+                    + "Use patch_bytes with raw hex instead. Common encodings:\n"
+                    + "  NOP         = 90\n"
+                    + "  RET         = C3\n"
+                    + "  XOR EAX,EAX = 31C0\n"
+                    + "  MOV EAX,1   = B801000000\n"
+                    + "  JMP rel8    = EB<offset> (2 bytes)\n"
+                    + "  JNE rel8    = 75<offset> NOP with 9090\n"
+                    + "  JE  rel8    = 74<offset> NOP with 9090";
+                sendResponse(ex, 400, tip);
+            } catch (Exception e) {
+                prog().endTransaction(tx, false);
+                sendResponse(ex, 500,
+                    "patch_instruction failed: " + e.getMessage()
+                    + "\nUse patch_bytes with raw hex as a reliable fallback.");
+            }
+        } catch (Exception outer) {
+            try { prog().endTransaction(tx, false); } catch (Exception ignored) {}
+            sendResponse(ex, 500, "patch_instruction error: " + outer.getMessage());
         }
     }
 
@@ -698,7 +730,6 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         String outPath = b.get("path");
         if (outPath == null) { sendResponse(ex, 400, "path required"); return; }
 
-        // Get the original binary path from Ghidra's program
         String origPath = prog().getExecutablePath();
         if (origPath == null || origPath.isEmpty()) {
             sendResponse(ex, 500, "Cannot determine original executable path from Ghidra"); return;
@@ -711,47 +742,56 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         File outFile = new File(outPath);
         if (outFile.getParentFile() != null) outFile.getParentFile().mkdirs();
 
-        // Step 1: copy original file verbatim → preserves ELF/PE headers and structure
+        // Step 1: copy original file verbatim — ELF/PE structure fully preserved
         Files.copy(origFile.toPath(), outFile.toPath(),
                    java.nio.file.StandardCopyOption.REPLACE_EXISTING);
 
-        // Step 2: Walk memory blocks and write patched bytes at correct file offsets.
-        // Use MemoryBlockSourceInfo.getFileBytesOffset() — the correct Ghidra API
-        // for getting the actual offset into the backing FileBytes (i.e. the file).
-        // This works correctly for ELF, PE, and PIE binaries regardless of imageBase.
-        int patchedBlocks = 0;
+        // Step 2: read original file bytes into memory for diff comparison
+        byte[] origBytes = Files.readAllBytes(origFile.toPath());
+
+        // Step 3: Only patch executable sections (.text and similar).
+        // NEVER touch .got, .got.plt, .plt, .dynamic, .data — Ghidra stores
+        // resolved runtime addresses there which differ from on-disk relocatable
+        // entries, causing GOT corruption and SIGSEGV on startup.
+        int patchCount = 0;
         try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(outFile, "rw")) {
             for (MemoryBlock block : prog().getMemory().getBlocks()) {
                 if (!block.isInitialized()) continue;
+                if (!block.isExecute()) continue; // ONLY executable blocks (.text)
 
                 java.util.List<MemoryBlockSourceInfo> infos = block.getSourceInfos();
                 if (infos == null || infos.isEmpty()) continue;
 
                 MemoryBlockSourceInfo info = infos.get(0);
-                // getFileBytesOffset() returns long in this Ghidra version; -1 means not file-backed
                 long fileOffset = info.getFileBytesOffset();
                 if (fileOffset < 0) continue;
-                long blockSize  = block.getSize();
-                long writeSize  = Math.min(blockSize, outFile.length() - fileOffset);
-                if (fileOffset < 0 || fileOffset >= outFile.length() || writeSize <= 0) continue;
 
-                byte[] buf = new byte[(int) writeSize];
-                block.getBytes(block.getStart(), buf);
+                long blockSize = block.getSize();
+                long available = origBytes.length - fileOffset;
+                if (available <= 0) continue;
+                int readSize = (int) Math.min(blockSize, available);
 
-                raf.seek(fileOffset);
-                raf.write(buf);
-                patchedBlocks++;
+                // Read current (possibly patched) bytes from Ghidra memory
+                byte[] memBytes = new byte[readSize];
+                block.getBytes(block.getStart(), memBytes);
+
+                // Write ONLY bytes that differ from original (surgical patch)
+                for (int i = 0; i < readSize; i++) {
+                    if (memBytes[i] != origBytes[(int)(fileOffset + i)]) {
+                        raf.seek(fileOffset + i);
+                        raf.write(memBytes[i]);
+                        patchCount++;
+                    }
+                }
             }
         }
 
         outFile.setExecutable(true);
-        if (patchedBlocks == 0) {
-            sendResponse(ex, 200, "WARNING: exported " + outFile.length() + " bytes to " + outPath +
-                " but no file-backed blocks were found — file may be unpatched. " +
-                "Ensure the binary was loaded from disk (not imported from project).");
+        if (patchCount == 0) {
+            sendResponse(ex, 200, "WARNING: no byte differences found — exported unmodified copy of " + origPath);
         } else {
-            sendResponse(ex, 200, "Exported " + outFile.length() + " bytes to " + outPath +
-                " (original: " + origPath + ", patched blocks: " + patchedBlocks + ")");
+            sendResponse(ex, 200, "Exported to " + outPath +
+                " (" + patchCount + " byte(s) patched from original: " + origPath + ")");
         }
     }
 
@@ -765,4 +805,10 @@ public class GhidraMCPExtendedPlugin extends ProgramPlugin {
         }
         return null;
     }
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) sb.append(String.format("%02X", b));
+        return sb.toString();
+    }
+
 }
